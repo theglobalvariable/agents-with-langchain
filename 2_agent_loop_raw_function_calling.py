@@ -3,9 +3,8 @@ from langsmith import traceable
 
 load_dotenv()
 
-from langchain.chat_models import init_chat_model
-from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
-from langchain_core.tools import tool
+import ollama
+from ollama import Message
 
 MAX_ITERATIONS = 10
 
@@ -29,7 +28,7 @@ If you have the answer to the user's query and do not need to call any tools, re
 """
 
 
-@tool
+@traceable(name="Get Product Price Tool", run_type="tool")
 def get_product_price(product_name: str) -> float:
     """Look up the price of a product in the catalog."""
 
@@ -44,7 +43,7 @@ def get_product_price(product_name: str) -> float:
     return prices.get(product_name.lower(), 0)
 
 
-@tool
+@traceable(name="Apply Discount Tool", run_type="tool")
 def apply_discount(price: float, discount_tier: str) -> float:
     """
     Apply a discount to a price based on the discount tier.
@@ -66,26 +65,74 @@ def apply_discount(price: float, discount_tier: str) -> float:
     return round(discounted_price, 2)
 
 
-@traceable(name="LangChain Agent Loop with Tool Calling")
-def run_agent(question: str):
-    tools = [get_product_price, apply_discount]
-    tool_dict = {tool.name: tool for tool in tools}
+# define tools JSON for LLM
+tools_for_llm = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_product_price",
+            "description": "Look up the price of a product in the catalog.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "product_name": {
+                        "type": "string",
+                        "description": "The name of the product to look up.",
+                    }
+                },
+                "required": ["product_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "apply_discount",
+            "description": "Apply a discount to a price based on the discount tier.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "price": {
+                        "type": "number",
+                        "description": "The original price of the product.",
+                    },
+                    "discount_tier": {
+                        "type": "string",
+                        "description": 'The discount tier to apply. Available tiers: "bronze", "silver", "gold".',
+                    },
+                },
+                "required": ["price", "discount_tier"],
+            },
+        },
+    },
+]
 
-    llm = init_chat_model(f"ollama:{MODEL}", temperature=0)
-    llm_with_tools = llm.bind_tools(tools)
+
+@traceable(name="Ollama Chat", run_type="llm")
+def ollama_chat(messages):
+    return ollama.chat(model=MODEL, tools=tools_for_llm, messages=messages)
+
+
+@traceable(name="Agent Loop with Raw Function Calling")
+def run_agent(question: str):
+    tool_dict = {
+        "get_product_price": get_product_price,
+        "apply_discount": apply_discount,
+    }
+
+    messages: list[Message] = [
+        Message(role="system", content=SYSTEM_PROMPT),
+        Message(role="user", content=question),
+    ]
 
     print(f"Question: {question}")
     print("=" * 50)
 
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=question),
-    ]
-
     for iteration in range(1, MAX_ITERATIONS + 1):
         print(f"--- Iteration {iteration} ---")
 
-        ai_message = llm_with_tools.invoke(messages)
+        response = ollama_chat(messages)
+        ai_message = response.message
         messages.append(ai_message)
 
         tool_calls = ai_message.tool_calls
@@ -97,9 +144,8 @@ def run_agent(question: str):
         print(f"AI called {len(tool_calls)} tool(s):")
 
         for tool_call in tool_calls:
-            tool_name = tool_call.get("name")
-            tool_args = tool_call.get("args", {})
-            tool_call_id = tool_call.get("id")
+            tool_name = tool_call.function.name
+            tool_args = tool_call.function.arguments
 
             print(f"  - [Tool] {tool_name} with args: {tool_args}")
 
@@ -107,12 +153,10 @@ def run_agent(question: str):
             if tool_to_call is None:
                 print(f"    >> Error: Tool '{tool_name}' not found.")
             else:
-                tool_result = tool_to_call.invoke(tool_args)
+                tool_result = tool_to_call(**tool_args)
                 print(f"    >> Tool result: {tool_result}")
 
-                messages.append(
-                    ToolMessage(content=str(tool_result), tool_call_id=tool_call_id)
-                )
+                messages.append(Message(role="tool", content=str(tool_result)))
 
     print("ERROR: Reached maximum iterations without a final answer.")
     return None
